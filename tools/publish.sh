@@ -89,37 +89,32 @@ echo "  进度看这里： $RUN_URL"
 echo "  编译约 40~90 分钟（首次全量）"
 echo "========================================================"
 echo
-echo ">>> 6/6 等待编译结束（每 60 秒查一次，Ctrl-C 可以随时退出，不影响云端任务）"
 
-while true; do
-	JSON="$(api "$API/repos/$LOGIN/$REPO_NAME/actions/runs?branch=main&per_page=1")" || { sleep 60; continue; }
-	STATUS="$(echo "$JSON" | sed -n 's/.*"status": *"\([^"]*\)".*/\1/p' | head -1)"
-	CONC="$(echo "$JSON" | sed -n 's/.*"conclusion": *\(null\|"[^"]*"\).*/\1/p' | head -1)"
-	RUNID="$(echo "$JSON" | sed -n 's/.*"id": *\([0-9]*\).*/\1/p' | head -1)"
+echo ">>> 6/6 锁定本次触发的 run id"
+# 关键：必须按 id 跟踪，不能按"最新一次运行"。否则之后任何一个 commit
+# （哪怕只改了 README）触发新运行，轮询就会切过去，等到的是别人的结论。
+sleep 8
+RUNID="$(python3 - <<PY
+import json, os, urllib.request
+T = os.environ['TOKEN']
+hdr = {'Authorization': 'Bearer ' + T, 'Accept': 'application/vnd.github+json'}
+def get(p):
+    r = urllib.request.Request('https://api.github.com' + p, headers=hdr)
+    with urllib.request.urlopen(r) as x:
+        return json.loads(x.read() or b'{}')
+rs = get('/repos/$LOGIN/$REPO_NAME/actions/runs?branch=main&per_page=10').get('workflow_runs', [])
+# 取 head_sha 与本地产出提交一致的最新一次
+mine = os.popen('git -C "$ROOT" rev-parse HEAD').read().strip()
+cand = [r for r in rs if r['head_sha'] == mine]
+print((cand[0] if cand else (rs[0] if rs else {'id': ''}))['id'])
+PY
+)"
+if [ -z "$RUNID" ]; then
+	echo "  !! 没定位到 run id，去 $RUN_URL 手动看吧"
+	exit 1
+fi
+echo "  run id = $RUNID"
 
-	printf '  [%s] status=%s conclusion=%s\n' "$(date +%H:%M:%S)" "$STATUS" "${CONC:-null}"
-
-	if [ "$STATUS" = "completed" ]; then
-		if [ "$CONC" = '"success"' ]; then
-			echo
-			echo ">>> 编译成功，下载固件"
-			mkdir -p "$ROOT/dist"
-			ART="$(api "$API/repos/$LOGIN/$REPO_NAME/actions/runs/$RUNID/artifacts")"
-			IDS="$(echo "$ART" | sed -n 's/.*"id": *\([0-9]*\), *"node_id.*/\1/p')"
-			for id in $IDS; do
-				curl -fsSL -H "Authorization: Bearer $TOKEN" -L \
-					"$API/repos/$LOGIN/$REPO_NAME/actions/artifacts/$id/zip" \
-					-o "$ROOT/dist/artifact-$id.zip"
-				echo "  dist/artifact-$id.zip  $(du -h "$ROOT/dist/artifact-$id.zip" | cut -f1)"
-			done
-			echo
-			echo "解压： unzip dist/artifact-*.zip -d dist/"
-			exit 0
-		else
-			echo
-			echo "!! 编译失败。日志： $RUN_URL/runs/$RUNID"
-			exit 1
-		fi
-	fi
-	sleep 60
-done
+echo ">>> 等待编译结束（每 60 秒查一次，Ctrl-C 可以随时退出，不影响云端任务）"
+GITHUB_TOKEN="$TOKEN" GITHUB_REPO="$LOGIN/$REPO_NAME" \
+	bash "$ROOT/tools/wait.sh" "$RUNID"

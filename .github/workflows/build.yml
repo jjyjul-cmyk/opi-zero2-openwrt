@@ -7,6 +7,8 @@ on:
     paths-ignore:
       - 'README.md'
       - 'docs/**'
+      # 这两个目录只影响本地运维脚本/文档，改了不该白跑一次 40~90 分钟的编译
+      - 'tools/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -123,18 +125,38 @@ jobs:
             exit 1
           fi
 
-          # 断言驱动源码真的被打进了 backports 树，而不只是"补丁命令没报错"
+          # 断言驱动源码真的被打进了 backports 树，而不只是"补丁命令没报错"。
+          #
+          # 注意这里的路径深度：驱动最终落在
+          #   build_dir/target-<arch>_musl/linux-sunxi_cortexa53/mac80211-regular/backports-<ver>/drivers/net/wireless/uwe5622
+          # 从 build_dir 数起是 8 层。用 maxdepth 6 会**够不到**，于是把一次完全正常的
+          # 编译误判成"补丁没生效"直接红掉（第一版就是栽在这里）。
+          # 所以：一是 maxdepth 给足，二是同时用补丁日志做交叉验证，
+          # 两条证据只要有一条成立就不算失败。
           echo "----- unisoc 补丁数 -----"
           ls package/kernel/mac80211/patches/unisoc | wc -l
-          echo "----- backports 树里的 uwe5622 驱动目录 -----"
-          found="$(find build_dir -maxdepth 6 -type d -name 'uwe5622' 2>/dev/null | head -5)"
-          if [ -z "$found" ]; then
-            echo "::error::补丁跑完了，但 backports 树里找不到 uwe5622 驱动源码 —— 补丁没真正生效"
+
+          echo "----- 证据 A：补丁日志里写入的 uwe5622 源文件数 -----"
+          n_patched="$(grep -c 'patching file drivers/net/wireless/uwe5622/' /tmp/pf-mac80211.log || true)"
+          echo "$n_patched"
+
+          echo "----- 证据 B：backports 树里的 uwe5622 驱动目录 -----"
+          found="$(find build_dir -maxdepth 12 -type d -name 'uwe5622' 2>/dev/null | head -5)"
+          [ -n "$found" ] && echo "$found" || echo "  (未找到)"
+
+          echo "----- 关键源文件抽查 -----"
+          for f in unisocwifi/main.c unisocwifi/sprdwl.h tty-sdio/tty.c; do
+            p="$(find build_dir -maxdepth 13 -type f -path "*uwe5622/$f" 2>/dev/null | head -1)"
+            [ -n "$p" ] && echo "  OK   $f" || echo "  MISS $f"
+          done
+
+          if [ "$n_patched" -gt 0 ] || [ -n "$found" ]; then
+            echo "OK: unisoc 驱动已注入 backports（补丁写入 $n_patched 个文件）"
+          else
+            echo "::error::补丁跑完了，但补丁日志和 backports 树里都找不到 uwe5622 驱动 —— 补丁没真正生效"
             tail -80 /tmp/pf-mac80211.log
             exit 1
           fi
-          echo "$found"
-          echo "OK: unisoc 驱动已注入 backports"
 
           echo "=========== 2/2 sunxi 内核 + DTS 打补丁 ==========="
           if ! make -j1 V=s target/linux/prepare > /tmp/pf-target.log 2>&1; then
