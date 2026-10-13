@@ -74,6 +74,16 @@ openwrt-24.10 的 `target/linux/generic/config-6.6` 里这四项**全是关的**
 生效机制是 `include/kernel-defaults.mk:117` —— 它把 `.config` 里所有 `CONFIG_KERNEL_*` 去掉前缀后
 **追加**到内核 `.config.target` 末尾，所以能覆盖上面的基线。
 
+**这里有个很坑的写法错误**：`veth` 在 OpenWrt 里**不是** `CONFIG_KERNEL_` 符号。
+它由 `kmod-veth` 这个内核模块包用 `KCONFIG:=CONFIG_VETH` 驱动（`package/kernel/linux/modules/netsupport.mk:522`），
+所以正确写法是 `CONFIG_PACKAGE_kmod-veth=y`。写 `CONFIG_KERNEL_VETH=y` 会被 `make defconfig`
+**静默丢弃**——不报错、不警告，你以为开了其实没开。
+
+> 排查这类问题要注意：`config/Config-kernel.in` 里 cgroup / namespace 的子项是**带 Tab 缩进**
+> 写在 `if KERNEL_CGROUPS` / `if KERNEL_NAMESPACES` 块里的。用 `grep '^config KERNEL_'` 会
+> **把 `KERNEL_CGROUP_DEVICE`、`KERNEL_MEMCG`、`KERNEL_NET_NS` 等全部漏掉**，误判成"符号不存在"。
+> 正确写法是 `grep -E '^[[:space:]]*config KERNEL_'`。
+
 顺带：`CONFIG_OVERLAY_FS` 基线里本来就是 `y`（第 4395 行），Docker 的 overlay2 存储驱动不用管。
 
 **还有一个隐藏的坑**：sunxi 的 sdcard 镜像是**编译期定死大小**的（`gen_sunxi_sdcard_img.sh` 吃
@@ -84,21 +94,33 @@ openwrt-24.10 的 `target/linux/generic/config-6.6` 里这四项**全是关的**
 
 ## 三、怎么出固件
 
-推上 GitHub，进 **Actions → Build OpenWrt for Orange Pi Zero 2 → Run workflow**。
+仓库推上去后，`push` 本身就会触发编译；也可以在
+**Actions → Build OpenWrt for Orange Pi Zero 2 → Run workflow** 手动再跑一次。
+
+用 `tools/publish.sh` 的话，建仓库 → 推代码 → 触发 → 轮询 → 下载固件是一条命令走完的。
+
+**这次只把必要的坑填了，没有改 rootfs 形态**：`CONFIG_TARGET_ROOTFS_SQUASHFS` 和
+`CONFIG_TARGET_ROOTFS_EXT4FS` 都保持为开，与上游 sunxi 的 `FEATURES`（含 `ext4` 与 `squashfs`）一致，
+出镜像的形态因此和官方发布版完全相同。
 
 流程里有一步叫 **"预检 · 只打补丁不编译"**，这是刻意加的：
 
 > AW859A 的驱动是靠补丁注入 backports 的。如果哪天 backports 版本再漂移、或 DTS 上下文变了，
 > 这一步会在 **5～10 分钟**内失败并直接给出 `tail -150` 的日志。
 > 不然你要等一小时才知道补丁没打上。
+>
+> 它还会断言 `build_dir` 里真的出现了 `uwe5622` 目录——防止"补丁命令没报错但其实没生效"。
 
 - 首次全量：约 40～90 分钟（含工具链）
 - 有 ccache 命中后：约 15～25 分钟
 
-出产物在 **Artifacts → `openwrt-24.10-orangepi-zero2`**，包含：
+> ccache 目录要注意：`rules.mk:346` 定义的默认值是 `$(TOPDIR)/.ccache`，
+> 也就是 `openwrt/.ccache`，**不是 `~/.ccache`**。缓存错路径等于没有缓存，每次都要全量重编。
+
+产物在 **Artifacts → `openwrt-24.10-orangepi-zero2`**（文件名已对照官方 24.10.8 下载目录确认）：
 
 ```
-openwrt-24.10.8-sunxi-cortexa53-xunlong_orangepi-zero2-ext4-sdcard.img.gz      ← 推荐
+openwrt-24.10.8-sunxi-cortexa53-xunlong_orangepi-zero2-ext4-sdcard.img.gz      ← 跑 Docker 用这个
 openwrt-24.10.8-sunxi-cortexa53-xunlong_orangepi-zero2-squashfs-sdcard.img.gz
 sha256sums
 profiles.json
@@ -204,8 +226,16 @@ cat /etc/config/wireless
 
 ### 其它
 
+- **已核实（对着本地解压的完整 24.10 源码树逐条比对）**：
+  - 移植仓库的 12 个 sunxi 补丁与上游 `target/linux/sunxi/patches-6.6` 里的 27 个补丁**零重名**，
+    可以整批放入；`cp -an` 已保证万一上游将来收录同名补丁也不会覆盖。
+  - `configs/zero2.config` 里 16 个 `CONFIG_KERNEL_*` 符号、以及设备/镜像/软件包符号，
+    全部在源码树里真实存在。唯一的例外 `CONFIG_KERNEL_VETH` 已删除（原因见第二节）。
+  - 工作流里加了一道配置校验，任何 `MISS` 都会在编译前直接终止，不会白等一小时。
 - **剩余风险**：移植仓库最后更新在 2025-08，当时对齐的是 backports 6.12.6；现在 24.10 分支是 6.12.96。
-  DTS 补丁也可能因为 24.10 的 DTS 演进失配。两者都由"预检"那一步提前暴露。
+  DTS 补丁也可能因为 24.10 的 DTS 演进失配（`Device/Default` 的 DTS 会被上游
+  `016`/`023` 等补丁改过，而移植仓库的 DTS 补丁按文件名排序会排在它们**之后**应用）。
+  两者都由"预检"那一步提前暴露。
   真失配了，方案是**把 OpenWrt 树 pin 到 2025 年年中的 commit**，让上下文回到作者测过的状态。
 - **不要**把 `files/` 里的 `etc/init.d/*` 改成非可执行——git 在 Windows 上不记可执行位，
   `scripts/diy.sh` 结尾会统一 `chmod 0755` 补回来。
