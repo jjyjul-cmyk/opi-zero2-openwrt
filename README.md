@@ -25,7 +25,7 @@
 
 ---
 
-## 二、这个工程踩掉的三个坑
+## 二、这个工程踩掉的四个坑
 
 ### 坑 1：移植仓库自带的 `mac80211/Makefile` 会毁掉整次编译
 
@@ -89,6 +89,54 @@ openwrt-24.10 的 `target/linux/generic/config-6.6` 里这四项**全是关的**
 **还有一个隐藏的坑**：sunxi 的 sdcard 镜像是**编译期定死大小**的（`gen_sunxi_sdcard_img.sh` 吃
 `CONFIG_TARGET_ROOTFS_PARTSIZE`），刷完**不会自动扩容**。官方默认只有 **104 MiB**，`docker pull` 第一个镜像就爆盘。
 本工程设成 **2048 MiB**。
+
+### 坑 4：内核 `syncconfig` 会因为一个上游新符号直接把编译打断
+
+这个坑是**实际编译到 29 分钟时才炸**的，报错长这样：
+
+```
+  Realtek PHYs (REALTEK_PHY) [Y/n/m/?] y
+    HWMON support for Realtek PHYs (REALTEK_PHY_HWMON) [N/y/?] (NEW)
+make[8]: *** [scripts/kconfig/Makefile:77: syncconfig] Error 1
+make[7]: *** [Makefile:697: syncconfig] Error 2
+ERROR: target/linux failed to build.
+```
+
+**不是我们的驱动、也不是 Docker 配置的问题**，是上游 24.10 分支的一个回归：
+
+| | 原始（24.10 早期） | 现在（backport `781-27`） |
+|---|---|---|
+| Kconfig | `def_bool REALTEK_PHY && HWMON` | `bool "HWMON support for Realtek PHYs"` |
+| 有无默认值 | **有** → 内核从不追问 | **没有** → 内核必须追问 |
+| 可见性 | 内部符号 | 用户可见 |
+
+而 `target/linux/sunxi/config-6.6` 里 `CONFIG_REALTEK_PHY=y`、`CONFIG_HWMON=y`：
+两个依赖都满足，符号就**可见**了；但整个 `config-6.6` 里**没有它的条目**，于是它**没有值**。
+内核的 `syncconfig` 在非交互环境下会对「没有值」的符号发问，读到 EOF 就 `exit 1`。
+
+> 判定依据在内核源码里写得很明确：`scripts/kconfig/conf.c` 的 `check_conf()` 条件是
+> `if (sym && !sym_has_value(sym) && (sym_is_changeable(sym) || ...))`，
+> 走 `default:` 分支 → `printf("*\n* Restart config...\n*\n")` → `conf(rootEntry)` 打印整段菜单并提问。
+> 这个 `default:` 分支对**所有输入模式**生效（只有 `listnewconfig` / `helpnewconfig` 除外），
+> 所以 `--syncconfig` 也会问。
+
+**官方 release 为什么没踩到？** 因为官方那套 `.config` 带 `CONFIG_ALL_KMODS=y`
+（见 `targets/sunxi/cortexa53/config.buildinfo`），必然会选中 `kmod-hwmon-core`；而它的定义是
+`KCONFIG:=CONFIG_HWMON`（`package/kernel/linux/modules/hwmon.mk:14`），于是 `.config.override`
+把 `CONFIG_HWMON` 压成 `=m`。此时依赖 `!(REALTEK_PHY=y && HWMON=m)` 为**假**，符号直接隐藏，根本不会被问。
+我们是精简包集（不编译全部 kmod），`HWMON` 保持 `config-6.6` 里的 `=y` —— 于是中招。
+
+**两道保险**（都在 `scripts/diy.sh` 里，且都是幂等的）：
+
+1. 给该符号显式赋值：往 `target/linux/sunxi/config-6.6` 追加
+   `# CONFIG_REALTEK_PHY_HWMON is not set`。
+2. **通用兜底**：在 `include/kernel-defaults.mk` 的 `Kernel/Configure/Default` 里、
+   写完内核 `.config` 之后插入一行 `yes '' | $(KERNEL_MAKE) oldconfig`。
+   这样任何「可见但无默认值」的新符号都会自动取默认值，不再有非交互 EOF 问题。
+   插入前会断言锚点唯一、插入后会在自检里 `grep` 标记，防止静默失效。
+
+> 为什么不是简单地把 `CONFIG_ALL_KMODS=y` 打开？那会把所有内核模块都编进去，
+> 编译时间从 40 分钟涨到数小时，镜像也大得多。上面两条只改配置，不增加产物。
 
 ---
 
@@ -232,11 +280,20 @@ cat /etc/config/wireless
   - `configs/zero2.config` 里 16 个 `CONFIG_KERNEL_*` 符号、以及设备/镜像/软件包符号，
     全部在源码树里真实存在。唯一的例外 `CONFIG_KERNEL_VETH` 已删除（原因见第二节）。
   - 工作流里加了一道配置校验，任何 `MISS` 都会在编译前直接终止，不会白等一小时。
-- **剩余风险**：移植仓库最后更新在 2025-08，当时对齐的是 backports 6.12.6；现在 24.10 分支是 6.12.96。
-  DTS 补丁也可能因为 24.10 的 DTS 演进失配（`Device/Default` 的 DTS 会被上游
-  `016`/`023` 等补丁改过，而移植仓库的 DTS 补丁按文件名排序会排在它们**之后**应用）。
-  两者都由"预检"那一步提前暴露。
+- **backports 版本失配风险 —— 已实测排除**：移植仓库最后更新在 2025-08，当时对齐 backports 6.12.6，
+  而 24.10 分支现在是 6.12.96。实际跑过之后，**15 个 unisoc 补丁全部干净应用**
+  （`104`~`114` 逐个 `Applying ... using plaintext`，无一处 hunk 失败），
+  `make package/kernel/mac80211/prepare` 正常退出。所以**不需要** pin 老 commit。
+- **仍需观察**：预检第二段 `make target/linux/prepare`（sunxi 的 12 个 DTS/内核补丁）。
+  DTS 补丁可能因 24.10 的 DTS 演进失配（`Device/Default` 的 DTS 会被上游 `016`/`023` 等补丁改过，
+  而移植仓库的 DTS 补丁按文件名排序排在它们**之后**应用）。由预检这一步兜住。
   真失配了，方案是**把 OpenWrt 树 pin 到 2025 年年中的 commit**，让上下文回到作者测过的状态。
+- **写断言不要制造假阴性**（踩过的坑）：预检里查驱动是否注入，第一版写
+  `find build_dir -maxdepth 6 -type d -name uwe5622` —— 而驱动实际落在 `build_dir` 下**第 8 层**
+  （`target-<arch>_musl/linux-sunxi_cortexa53/mac80211-regular/backports-<ver>/drivers/net/wireless/uwe5622`），
+  于是一次完全正常的编译被误判成"补丁没生效"直接红掉。现在改成**两条独立证据、任一成立即通过**
+  （补丁日志里的 `patching file .../uwe5622/` 计数 + `maxdepth 12` 的目录查找），并额外抽查三个关键源文件。
+  校验逻辑本身也会出错，别让它比它要防的问题更脆弱。
 - **不要**把 `files/` 里的 `etc/init.d/*` 改成非可执行——git 在 Windows 上不记可执行位，
   `scripts/diy.sh` 结尾会统一 `chmod 0755` 补回来。
 

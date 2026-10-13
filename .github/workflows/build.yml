@@ -197,17 +197,35 @@ jobs:
           cp -v openwrt/bin/targets/sunxi/cortexa53/sha256sums out/ 2>/dev/null || true
           cp -v openwrt/bin/targets/sunxi/cortexa53/profiles.json out/ 2>/dev/null || true
           cp -v openwrt/.config out/zero2.build.config 2>/dev/null || true
+
+          # 额外捞两个「编译出来了、但官方不发布」的文件。
+          #   xunlong_orangepi-zero2-u-boot-with-spl.bin —— u-boot + SPL。
+          #     Allwinner BootROM 从 SD 卡第 8KiB 处加载，gen_sunxi_sdcard_img.sh 里
+          #     那句 `dd bs=1024 if="$UBOOT" of="$OUTPUT" seek=8` 用的就是它。
+          #   xunlong_orangepi-zero2-boot.scr —— FAT 启动分区里的 U-Boot 脚本。
+          # 这两个只存在于 staging_dir/target-*/image/，bin/targets/ 里没有，
+          # 所以官方下载目录里一个 .bin 都找不到（已核对 sha256sums）。
+          for f in xunlong_orangepi-zero2-u-boot-with-spl.bin xunlong_orangepi-zero2-boot.scr; do
+            src="$(find openwrt/staging_dir -maxdepth 3 -name "$f" 2>/dev/null | head -1)"
+            if [ -n "$src" ]; then
+              cp -v "$src" out/
+            else
+              echo "  [!] 未找到 $f（不影响刷机：u-boot 已经 dd 进 img.gz 了）"
+            fi
+          done
+
           echo "----- 产物清单 -----"
           ls -lh out/
-          # sunxi 的 Device/Default 只声明了 IMAGES := sdcard.img.gz，
-          # 所以每个设备只有一个镜像文件。这里做硬断言，避免"编译成功但没产物"
-          # 时 upload-artifact 静默上传一个只有 config 的空包。
+          # sunxi 的 Device/Default 声明的是 IMAGES := sdcard.img.gz；同时打开 squashfs 和
+          # ext4 两种 rootfs 时，OpenWrt 会把 rootfs 类型插进文件名，于是产出两个：
+          #   ...-ext4-sdcard.img.gz / ...-squashfs-sdcard.img.gz
+          # （已对照官方 24.10.8 下载目录确认；注意这里**没有 .bin**，可启动镜像就是 img.gz）
           ls out/*.img.gz >/dev/null 2>&1 || {
             echo "::error::out/ 里没有任何 *.img.gz —— 镜像命名可能变了，检查上面的产物清单"
             exit 1
           }
           echo "----- 校验 -----"
-          ( cd out && sha256sum *.img.gz 2>/dev/null || true )
+          ( cd out && sha256sum *.img.gz *.bin 2>/dev/null || true )
 
       - name: 上传固件
         if: success()

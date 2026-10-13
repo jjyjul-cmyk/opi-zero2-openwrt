@@ -40,7 +40,7 @@ die() { echo "!! $*" >&2; exit 1; }
 MACDIR="$SRC/package/kernel/mac80211"
 MACMK="$MACDIR/Makefile"
 
-log "0/5 体检当前源码树"
+log "0/6 体检当前源码树"
 [ -f "$MACMK" ] || die "缺少 $MACMK"
 grep -q 'PKG_NAME:=mac80211' "$MACMK" || die "mac80211 包结构异常"
 BACKPORTS="$(grep -m1 '^PKG_VERSION:=' "$MACMK" | cut -d: -f2)"
@@ -50,7 +50,7 @@ for anchor in 'include realtek.mk' 'PatchDir,$(PKG_BUILD_DIR),$(PATCH_DIR)/rtl,r
 done
 echo "  3 个注入锚点都在"
 
-log "1/5 拉取 AW859A / UWE5622 驱动移植"
+log "1/6 拉取 AW859A / UWE5622 驱动移植"
 rm -rf /tmp/uwe5622
 git clone --depth 1 -b "$PATCH_REPO_REF" "$PATCH_REPO" /tmp/uwe5622
 UP=/tmp/uwe5622
@@ -58,7 +58,7 @@ UP=/tmp/uwe5622
 [ -f "$UP/package/kernel/mac80211/unisoc.mk" ]        || die "移植仓库结构变了：找不到 unisoc.mk"
 echo "  补丁数量: $(ls "$UP/package/kernel/mac80211/patches/unisoc" | wc -l)"
 
-log "2/5 注入 WiFi/蓝牙驱动（保留官方 mac80211/Makefile 版本）"
+log "2/6 注入 WiFi/蓝牙驱动（保留官方 mac80211/Makefile 版本）"
 cp -a "$UP/package/kernel/mac80211/unisoc.mk" "$MACDIR/"
 mkdir -p "$MACDIR/patches"
 cp -a "$UP/package/kernel/mac80211/patches/unisoc" "$MACDIR/patches/"
@@ -101,13 +101,71 @@ else:
     print('  Makefile 注入: ' + ', '.join(changed))
 PY
 
-log "3/5 注入 H616 / Zero2 的 DTS 与内核补丁"
+log "3/6 注入 H616 / Zero2 的 DTS 与内核补丁"
 mkdir -p "$SRC/target/linux/sunxi/patches-6.6"
 # 用 -n（no-clobber）：万一上游 24.10 已收录同名补丁，保留官方那份，绝不覆盖造成重复应用
 cp -an "$UP/target/linux/sunxi/patches-6.6/." "$SRC/target/linux/sunxi/patches-6.6/"
 echo "  已放入: $(ls "$UP/target/linux/sunxi/patches-6.6" | wc -l) 个文件"
 
-log "4/5 落盘 rootfs overlay（蓝牙上电脚本 + 首次启动默认项）"
+log "4/6 修掉上游 backport 引入的『可见但无默认值』内核符号"
+# 这是实测撞到的一个上游回归，不是我们的驱动引入的：
+#   backport-6.6/781-27 把 REALTEK_PHY_HWMON 从
+#       def_bool REALTEK_PHY && HWMON          （有默认值 → 内核从不追问）
+#   改成用户可见、且**完全没有默认值**的
+#       bool "HWMON support for Realtek PHYs"  （无默认值 → 内核必须追问）
+#   而 sunxi 目标的 config-6.6 里 REALTEK_PHY=y 且 HWMON=y，符号因此可见又没有值。
+#   非交互式 syncconfig 会为它打印提示，读不到输入就 exit 1：
+#       HWMON support for Realtek PHYs (REALTEK_PHY_HWMON) [N/y/?] (NEW)
+#       make[8]: *** [scripts/kconfig/Makefile:77: syncconfig] Error 1
+#   官方 release 为什么没踩到：它的 .config 带 CONFIG_ALL_KMODS=y，必然选中 kmod-hwmon-core，
+#   而 hwmon-core 的 KCONFIG 是 CONFIG_HWMON，于是 .config.override 把 HWMON 压成 =m；
+#   这时依赖 !(REALTEK_PHY=y && HWMON=m) 为假，符号直接隐藏。我们是精简包集，
+#   HWMON 保持 config-6.6 里的 =y，于是中招。
+#   两道保险：① 给该符号一个显式值；② 让内核 oldconfig 非交互执行（新符号一律取默认值）。
+KCFG="$SRC/target/linux/sunxi/config-6.6"
+if grep -q 'CONFIG_REALTEK_PHY_HWMON' "$KCFG"; then
+  echo "  $KCFG 已含 REALTEK_PHY_HWMON，跳过"
+else
+  printf '\n# 上游 backport 781-27 把它变成"可见但无默认值"的 bool；\n# 非交互 syncconfig 会因追问它而报错退出，这里显式给值为 n\n# CONFIG_REALTEK_PHY_HWMON is not set\n' >> "$KCFG"
+  echo "  已补 $KCFG : REALTEK_PHY_HWMON=n"
+fi
+
+KDEF="$SRC/include/kernel-defaults.mk"
+[ -f "$KDEF" ] || die "缺少 $KDEF"
+python3 - "$KDEF" <<'PY'
+import sys
+
+p = sys.argv[1]
+MARK = 'openwrt-opi-zero2:noninteractive-oldconfig'
+
+with open(p, encoding='utf-8', newline='') as f:
+    s = f.read()
+
+if MARK in s:
+    print('  kernel-defaults.mk 已打过补丁，跳过')
+    sys.exit(0)
+
+# 锚点必须唯一：Kernel/Configure/Default 里写内核 .config 之后、headers_install 之前
+anchor = '\t$(_SINGLE) [ -d $(LINUX_DIR)/user_headers ] || $(KERNEL_MAKE)'
+n = s.count(anchor)
+if n != 1:
+    sys.exit('!! kernel-defaults.mk 里锚点出现 %d 次（应为 1），上游结构变了，需要改脚本' % n)
+
+ins = (
+    '\t# ' + MARK + '\n'
+    '\t# 上游把某些 def_bool 改成"用户可见且无默认值"的 bool 后，\n'
+    '\t# 非交互 syncconfig 会对这类新符号发问，读不到输入就直接退出。\n'
+    "\t# 这里补一次非交互 oldconfig：所有新符号取默认值，与官方 ALL_KMODS 构建等效。\n"
+    "\tyes '' | $(KERNEL_MAKE) oldconfig\n"
+)
+s = s.replace(anchor, ins + anchor, 1)
+
+with open(p, 'w', encoding='utf-8', newline='') as f:
+    f.write(s)
+print('  kernel-defaults.mk 已注入非交互 oldconfig')
+PY
+
+log "5/6 落盘 rootfs overlay（蓝牙上电脚本 + 首次启动默认项）"
 mkdir -p "$SRC/files"
 cp -a "$ROOT/overlay/." "$SRC/files/"
 # git 在 Windows 上不记录可执行位，这里显式补回来，否则 init.d 脚本不会被执行
@@ -116,7 +174,7 @@ chmod 0755 "$SRC/files/etc/uci-defaults/"* 2>/dev/null || true
 echo "  overlay 文件:"
 find "$SRC/files" -type f | sed 's|^|    |'
 
-log "5/5 取 WiFi 固件与蓝牙二进制（直取，不克隆 armbian/firmware）"
+log "6/6 取 WiFi 固件与蓝牙二进制（直取，不克隆 armbian/firmware）"
 FW="$SRC/files/lib/firmware"
 BIN="$SRC/files/usr/bin"
 mkdir -p "$FW" "$BIN"
@@ -153,6 +211,8 @@ check "$SRC/files/etc/init.d/aw859a-bt"
 check "$SRC/files/lib/firmware/wcnmodem.bin"
 check "$BIN/hciattach_opi"
 grep -q 'include unisoc.mk' "$MACMK" || { echo "  MISS mac80211 Makefile 未挂载 unisoc"; missing=1; }
+grep -q 'CONFIG_REALTEK_PHY_HWMON' "$KCFG" || { echo "  MISS sunxi/config-6.6 未补 REALTEK_PHY_HWMON"; missing=1; }
+grep -q 'openwrt-opi-zero2:noninteractive-oldconfig' "$KDEF" || { echo "  MISS kernel-defaults.mk 未注入非交互 oldconfig"; missing=1; }
 [ "$missing" = "0" ] || die "改造不完整，见上面 MISS 项"
 
 log "源码树改造完成。"
