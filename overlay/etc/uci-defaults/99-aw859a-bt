@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# 首次启动自动执行一次，然后本文件会被删除。
+#
+# git 在 Windows 上不记录可执行位，所以 init.d 的 +x 是在 scripts/diy.sh 里补的；
+# 这里负责"开机自启"——/etc/rc.d/ 下的软链接没法通过 git 可靠地传过去，
+# 用 uci-defaults 在首次启动时 enable 一次最稳。
+
+# 蓝牙上电脚本
+[ -x /etc/init.d/aw859a-bt ] && /etc/init.d/aw859a-bt enable
+
+# bluez 的守护进程（不同版本脚本名不一样，都试一下）
+for s in bluetoothd bluetooth; do
+	[ -x "/etc/init.d/$s" ] && "/etc/init.d/$s" enable
+done
+
+exit 0

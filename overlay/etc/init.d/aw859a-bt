@@ -1,0 +1,127 @@
+#!/bin/sh /etc/rc.common
+#
+# Orange Pi Zero 2 (Allwinner H616 + AW859A/UWE5622) 蓝牙上电脚本
+#
+# 参数不是猜的，来自 Armbian 实测的 packages/bsp/sunxi/aw859a-bluetooth.service：
+#     ExecStartPre=/sbin/modprobe sunxi_addr
+#     ExecStartPre=/usr/sbin/rfkill unblock all
+#     ExecStart=/usr/bin/hciattach_opi -s 1500000 /dev/ttyBT0 sprd
+#
+# 三件事必须按顺序做对，缺一个都起不来：
+#   1) uwe5622_bsp_sdio + sprdbt_tty 载入 —— 后者会创建 /dev/ttyBT0 这个字符设备
+#   2) sunxi_addr 载入 —— 提供芯片 cid，驱动据此生成稳定的 WiFi/BT MAC
+#   3) 用定制版 hciattach 以 1500000 波特率按 sprd 协议挂 HCI
+#
+# 排查入口：logread -e aw859a-bt   以及   /tmp/aw859a-bt.log
+
+START=95
+STOP=05
+
+TTY=/dev/ttyBT0
+BAUD=1500000
+LOGF=/tmp/aw859a-bt.log
+
+# 两个 hciattach 版本都会依次尝试，日志里能看出哪个管用
+HCI_BINS="/usr/bin/hciattach_opi /usr/bin/hciattach_opi_upstream"
+HCI_DEBUG="/usr/bin/hciattach_opi -s $BAUD $TTY sprd"
+
+EXTRA_COMMANDS="status wifi"
+EXTRA_HELP="	status	查看蓝牙/串口/模块状态
+	wifi	单独加载板载无线并检查 wlan 接口"
+
+log() { echo "[aw859a-bt] $*"; logger -t aw859a-bt "$*"; }
+
+load_mods() {
+	for m in uwe5622_bsp_sdio sprdbt_tty sunxi_addr; do
+		modprobe "$m" 2>/dev/null || log "modprobe $m 无输出（可能已内建或已在位）"
+	done
+}
+
+wait_tty() {
+	i=0
+	while [ "$i" -lt 20 ]; do
+		[ -c "$TTY" ] && return 0
+		i=$((i + 1))
+		sleep 0.5
+	done
+	return 1
+}
+
+start() {
+	log "启动中"
+	load_mods
+
+	# busybox 自带 rfkill applet，正常都能调到
+	if command -v rfkill >/dev/null 2>&1; then
+		rfkill unblock all 2>/dev/null && log "rfkill 已全部解锁"
+	else
+		log "系统里没有 rfkill 命令，跳过解锁"
+	fi
+
+	if ! wait_tty; then
+		log "!! 10 秒内没等到 $TTY —— sprdbt_tty 没起来"
+		log "!! 先看 dmesg 里有没有 uwe5622 / tty-sdio 的报错"
+		dmesg | tail -40 >> "$LOGF" 2>/dev/null
+		return 1
+	fi
+	log "$TTY 已就绪"
+
+	# 两个 hciattach 版本都试：主用 arm64 版，失败退到 upstream 版
+	for bin in $HCI_BINS; do
+		[ -x "$bin" ] || continue
+		log "尝试 $bin -s $BAUD $TTY sprd"
+		if "$bin" -s "$BAUD" "$TTY" sprd >>"$LOGF" 2>&1; then
+			sleep 2
+			if [ -d /sys/class/bluetooth/hci0 ]; then
+				log "成功：hci0 已出现"
+				return 0
+			fi
+			log "$bin 执行成功但没看到 hci0"
+		else
+			log "$bin 执行失败"
+		fi
+	done
+
+	log "!! 两个 hciattach 都没能挂上 HCI，详见 $LOGF"
+	log "!! 上机后可手工重试： $HCI_DEBUG"
+	return 1
+}
+
+stop() {
+	killall hciattach_opi hciattach_opi_upstream 2>/dev/null
+	sleep 1
+	modprobe -r sprdbt_tty 2>/dev/null
+	modprobe -r uwe5622_bsp_sdio 2>/dev/null
+	log "已停止"
+}
+
+status() {
+	if [ -d /sys/class/bluetooth/hci0 ]; then
+		echo "hci0        : 存在"
+	else
+		echo "hci0        : 不存在"
+	fi
+	if [ -c "$TTY" ]; then
+		echo "$TTY     : 存在"
+	else
+		echo "$TTY     : 不存在"
+	fi
+	echo "-- 已加载模块 --"
+	lsmod | grep -E 'sprdbt_tty|sprdwl_ng|uwe5622|sunxi_addr' || echo "  (无)"
+	echo "-- 无线接口 --"
+	ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^wl|^wlan' || echo "  (无 wlan)"
+	echo "-- 最近日志 --"
+	tail -20 "$LOGF" 2>/dev/null || echo "  (无 $LOGF)"
+}
+
+wifi() {
+	load_mods
+	sleep 2
+	if ip -o link show 2>/dev/null | grep -qE 'wlan|wlp'; then
+		log "wlan 接口已出现"
+		iwinfo 2>/dev/null | head -20
+	else
+		log "!! 没有 wlan 接口，检查 sprdwl_ng 是否载入、固件是否在 /lib/firmware/"
+		ls /lib/firmware/ | grep -E 'wcnmodem|2355b' || log "!! /lib/firmware/ 里找不到 uwe5622 固件"
+	fi
+}

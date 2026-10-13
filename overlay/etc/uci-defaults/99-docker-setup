@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# 首次启动自动执行一次，然后本文件会被删除。
+# 只做"装完就能用"的最小设置，不改动任何网络策略。
+
+[ -f /etc/config/dockerd ] || exit 0
+
+# Docker 数据目录默认就是 /opt/docker/。sunxi 的 sdcard 镜像不会自动扩容，
+# 所以根分区大小是编译期用 CONFIG_TARGET_ROOTFS_PARTSIZE=2048 定死的。
+# 想换成 USB 盘/大容量 TF 卡，改这里并重启 docker：
+#   uci set dockerd.globals.data_root='/mnt/sda1/docker/'; uci commit dockerd
+uci -q set dockerd.globals.data_root='/opt/docker/'
+uci -q set dockerd.globals.log_level='warn'
+uci -q set dockerd.globals.iptables='1'
+uci -q commit dockerd
+
+mkdir -p /opt/docker
+
+# 开机自启
+[ -x /etc/init.d/dockerd ] && /etc/init.d/dockerd enable
+
+exit 0
