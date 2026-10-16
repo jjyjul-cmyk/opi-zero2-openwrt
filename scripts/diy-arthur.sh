@@ -44,28 +44,64 @@ if grep -n "192\.168\.1\.1" package/base-files/files/bin/config_generate; then
   echo "  [warn] 仍有 192.168.1.1 残留（可能是注释或别的用途），确认后自行决定" >&2
 fi
 
-echo "===== 2/5 去掉 WiFi：从默认包里删掉 ath11k 与 ipq-wifi ====="
-# 关键：ath11k-firmware-ipq6018 写在 target.mk 的 DEFAULT_PACKAGES 里，属于"目标默认包"。
-# Kconfig 里这类符号因为 DEFAULT_*=y 而没有 prompt，所以在 .config 里写
-# CONFIG_PACKAGE_kmod-ath11k=n 是关不掉的（make defconfig 会把它覆盖回 y）。
-# 同理 ipq-wifi-jdcloud_re-ss-01 写在设备定义的 DEVICE_PACKAGES 里，
-# CONFIG_TARGET_DEVICE_PACKAGES_...="" 也压不住。
-# 唯一可靠的办法：在源码层把这两个名字从默认包列表里删掉。
+echo "===== 2/5 去掉 WiFi：从默认包里删掉 ath11k / ipq-wifi / NSS 无线 mesh ====="
+# 无线相关的东西分散在三处声明，三处都要清：
+#   1) target/linux/qualcommax/Makefile            整个 target 的 DEFAULT_PACKAGES
+#      → kmod-ath11k kmod-ath11k-ahb kmod-ath11k-pci kmod-qca-nss-drv-wifi-meshmgr
+#   2) target/linux/qualcommax/ipq60xx/target.mk   子目标的 DEFAULT_PACKAGES
+#      → ath11k-firmware-ipq6018
+#   3) target/linux/qualcommax/image/ipq60xx.mk    亚瑟设备段 DEVICE_PACKAGES
+#      → ipq-wifi-jdcloud_re-ss-01（无线校准数据）
+# 这些"默认包"会生成 CONFIG_DEFAULT_<pkg>=y 元数据，纸面上看着像"已启用"，
+# 核对配置时很容易被误导。config 里的 =n 本身能关掉，这里再从源码层删一遍，
+# 是为了让"这台机器没有 WiFi"这件事在源码里就是显式的，不靠 config 的覆盖。
+#
+# 【踩过的坑】不能写 s/kmod-ath11k[[:space:]]*// 这种模式：
+# [[:space:]]* 允许匹配空串，会把 kmod-ath11k-ahb 里的前缀切掉、留下 "-ahb" 残渣。
+# 所以要求 token 两侧有空白（或行首/行尾），先删长名字。
+
+# 按 token 精确删除
+drop_tokens() {   # $1=文件  $2...=要删的 token（调用时请先长后短）
+  local f="$1"; shift
+  local t i
+  for t in "$@"; do
+    for i in 1 2 3; do
+      # 单引号里拼 "$t"，避免 $ 被 shell 吃掉
+      sed -i -E 's/(^|[[:space:]])'"$t"'([[:space:]]|$)/\1\2/g' "$f"
+    done
+  done
+}
+
+# 删完必须复核：把文件按空白切成 token 逐行精确匹配（子串匹配会误伤别的包名）
+assert_no_token() {   # $1=文件  $2...=不该再出现的 token
+  local f="$1"; shift
+  local t
+  for t in "$@"; do
+    if tr -s '[:space:]' '\n' < "$f" | grep -qx -- "$t"; then
+      echo "!! $f 里仍残留 $t" >&2
+      exit 1
+    fi
+  done
+}
+
+TM=target/linux/qualcommax/Makefile
+[ -f "$TM" ] || { echo "!! 找不到 $TM" >&2; exit 1; }
+drop_tokens "$TM" kmod-qca-nss-drv-wifi-meshmgr kmod-ath11k-pci kmod-ath11k-ahb kmod-ath11k
+assert_no_token "$TM" kmod-qca-nss-drv-wifi-meshmgr kmod-ath11k-pci kmod-ath11k-ahb kmod-ath11k
+echo "  $TM 已清理，DEFAULT_PACKAGES 现在是："
+sed -n '/^DEFAULT_PACKAGES/,/[^\\]$/p' "$TM" | sed 's/^/    /'
+
 TT=target/linux/qualcommax/ipq60xx/target.mk
 [ -f "$TT" ] || { echo "!! 找不到 $TT" >&2; exit 1; }
-sed -i 's/ath11k-firmware-ipq6018[[:space:]]*//; s/[[:space:]]*ath11k-firmware-ipq6018//' "$TT"
-if grep -q 'ath11k-firmware-ipq6018' "$TT"; then
-  echo "!! $TT 里仍残留 ath11k-firmware-ipq6018" >&2; exit 1
-fi
+drop_tokens "$TT" ath11k-firmware-ipq6018
+assert_no_token "$TT" ath11k-firmware-ipq6018
 echo "  $TT"
 grep '^DEFAULT_PACKAGES' "$TT" | sed 's/^/    /'
 
 IM=target/linux/qualcommax/image/ipq60xx.mk
 [ -f "$IM" ] || { echo "!! 找不到 $IM" >&2; exit 1; }
-sed -i '/^define Device\/jdcloud_re-ss-01$/,/^endef$/ s/ipq-wifi-jdcloud_re-ss-01[[:space:]]*//' "$IM"
-if sed -n '/^define Device\/jdcloud_re-ss-01$/,/^endef$/p' "$IM" | grep -q 'ipq-wifi'; then
-  echo "!! $IM 的亚瑟设备定义里仍残留 ipq-wifi" >&2; exit 1
-fi
+drop_tokens "$IM" ipq-wifi-jdcloud_re-ss-01
+assert_no_token "$IM" ipq-wifi-jdcloud_re-ss-01
 echo "  $IM 亚瑟段："
 sed -n '/^define Device\/jdcloud_re-ss-01$/,/^endef$/p' "$IM" | sed 's/^/    /'
 

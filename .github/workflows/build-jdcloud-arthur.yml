@@ -115,10 +115,13 @@ jobs:
           echo "===== 期望为 y 的关键项 ====="
           fail=0
           on_sym() {
-            if grep -qE "^CONFIG_(PACKAGE|DEFAULT|MODULE_DEFAULT)_$1=(y|m)$" .config; then
-              echo "  OK   $1"
+            # 必须是 =y。=m 只表示"编成模块但不装进镜像"，对"要预装到固件里"的包不合格
+            #（以前写成 (y|m)，会出现"闸门全绿但镜像里其实没有"的情况）。
+            if grep -qE "^CONFIG_PACKAGE_$1=y$" .config; then
+              echo "  OK   $1 = y"
             else
-              echo "  MISS $1"
+              v="$(grep -E "^CONFIG_PACKAGE_$1=|^# CONFIG_PACKAGE_$1 is not set$" .config | head -1)"
+              echo "  MISS $1 进不了镜像（${v:-.config 里根本没有这个符号}）"
               fail=1
             fi
           }
@@ -130,14 +133,18 @@ jobs:
               fail=1
             fi
           }
-          # 无线包在多机型构建里会被降级成 =m（留给别的机型），所以这里只要求"不是 =y"，
-          # 真正"没进镜像"由最后一步的 manifest 校验保证。
-          not_y_sym() {
-            if grep -qE "^CONFIG_(PACKAGE|DEFAULT|MODULE_DEFAULT)_$1=y$" .config; then
-              echo "  !!   $1 被编成了 built-in，无WiFi 不该出现"
+          # 判定"会不会进镜像"只能看 CONFIG_PACKAGE_xxx=y，不能看 CONFIG_DEFAULT_xxx /
+          # CONFIG_MODULE_DEFAULT_xxx —— 后两者只是"这个包属于本 target 的默认包列表"的
+          # 元数据。它们 =y 的时候包仍然可以是被关掉的：上游已验证的成品里
+          #   CONFIG_DEFAULT_kmod-qca-nss-drv-wifi-meshmgr=y
+          #   # CONFIG_PACKAGE_kmod-qca-nss-drv-wifi-meshmgr is not set
+          # 是并存的。把 DEFAULT_ 算进来会误报（曾经就这么白拦了一轮）。
+          not_built_in() {
+            if grep -qE "^CONFIG_PACKAGE_$1=y$" .config; then
+              echo "  !!   $1 会进镜像（built-in），无WiFi 不该出现"
               fail=1
             else
-              echo "  OK   非 built-in：$1"
+              echo "  OK   未进镜像：$1"
             fi
           }
 
@@ -165,8 +172,13 @@ jobs:
           for s in luci-app-passwall luci-app-openclash ; do
             off_sym "$s"
           done
-          for s in kmod-ath11k kmod-ath11k-ahb ath11k-firmware-ipq6018 ipq-wifi-jdcloud_re-ss-01 ; do
-            not_y_sym "$s"
+          # 无 WiFi 机型：这些一个都不该进镜像
+          #   ath11k 三兄弟 = 无线驱动；ath11k-firmware / ipq-wifi = 无线固件与校准数据；
+          #   nss-drv-wifi-meshmgr = NSS 的 WiFi mesh 卸载，没有 ath11k 就是死代码
+          for s in kmod-ath11k kmod-ath11k-ahb kmod-ath11k-pci \
+                   ath11k-firmware-ipq6018 ipq-wifi-jdcloud_re-ss-01 \
+                   kmod-qca-nss-drv-wifi-meshmgr ; do
+            not_built_in "$s"
           done
 
           echo "===== 依赖缺失检查 ====="
@@ -282,7 +294,11 @@ jobs:
           done
 
           echo "----- 必须没有 -----"
-          for p in ath11k-firmware-ipq6018 kmod-ath11k ipq-wifi-jdcloud_re-ss-01 luci-app-passwall; do
+          # WIFI 相关的包一个都不能出现在镜像里（这是"无 WiFi"的最终判据）
+          for p in kmod-ath11k kmod-ath11k-ahb kmod-ath11k-pci \
+                   ath11k-firmware-ipq6018 ath11k-firmware-qcn9074 ipq-wifi-jdcloud_re-ss-01 \
+                   kmod-qca-nss-drv-wifi-meshmgr \
+                   luci-app-passwall luci-app-passwall2 luci-app-openclash ; do
             if grep -q "^$p " "$MANIFEST"; then
               echo "  !!   竟然存在 $p"; fail=1
             else
