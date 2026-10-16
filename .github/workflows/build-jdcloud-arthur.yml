@@ -178,6 +178,25 @@ jobs:
             echo "  OK   没有不可用依赖"
           fi
 
+          echo "===== 种子 config 里声明的包是否都落地 ====="
+          # 写错包名 / 该包在当前源码里不存在时，make defconfig 会静默丢掉这一行，
+          # 于是"配了却没装"。这里把种子 config 里的包符号逐个回到 .config 里核对。
+          : > "$GITHUB_WORKSPACE/dropped.txt"
+          while read -r sym; do
+            [ -n "$sym" ] || continue
+            grep -qE "^CONFIG_${sym}=(y|m)$" .config || echo "$sym" >> "$GITHUB_WORKSPACE/dropped.txt"
+          done < <(grep -hoE '^CONFIG_PACKAGE_[A-Za-z0-9_+.-]+=y' \
+                     ../configs/arthur-device.config ../configs/arthur-packages.config \
+                   | sed 's/^CONFIG_//' | sort -u)
+
+          if [ -s "$GITHUB_WORKSPACE/dropped.txt" ]; then
+            echo "  以下包没落地（包名写错 / 当前源码里不存在）："
+            sed 's/^/    /' "$GITHUB_WORKSPACE/dropped.txt"
+            fail=1
+          else
+            echo "  OK   种子 config 里的包全部落地"
+          fi
+
           echo "===== 分区/镜像 ---"
           grep -E '^CONFIG_TARGET_ROOTFS_(SQUASHFS|EXT4FS)' .config || true
           cp .config "$GITHUB_WORKSPACE/arthur.build.config"

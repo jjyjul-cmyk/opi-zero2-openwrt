@@ -67,7 +67,7 @@ done
 # 放在 package/ 根下会被自动扫描，不需要 feeds install；校验一下 Makefile 真在
 [ -f package/luci-app-ssr-plus/Makefile ] || { echo "!! luci-app-ssr-plus 没拉下来" >&2; exit 1; }
 [ -f package/shadowsocksr-libev/Makefile ] || { echo "!! shadowsocksr-libev 没拉下来" >&2; exit 1; }
-echo "  ssr-plus 版本: $(grep -E '^PKG_VERSION' package/luci-app-ssr-plus/Makefile | head -1 | cut -d: -f2)"
+echo "  ssr-plus 版本: $(sed -n 's/^PKG_VERSION:=[[:space:]]*//p' package/luci-app-ssr-plus/Makefile | head -1)"
 
 echo "===== 3/4 注入 overlay（Open-Box 首启安装器）====="
 mkdir -p files
@@ -81,10 +81,28 @@ if [ ! -d feeds/nss_packages ]; then
   echo "   检查 feeds.conf.default 是否有 nss_packages 这一行（上游 laipeng668/immortalwrt 才有）。" >&2
   exit 1
 fi
-for p in qca-nss-drv qca-nss-ecm qca-nss-dp qca-nss-crypto firmware/nss-firmware; do
-  [ -e "feeds/nss_packages/$p" ] && echo "  OK   feeds/nss_packages/$p" || {
-    echo "!! feeds/nss_packages/$p 缺失" >&2; exit 1;
-  }
+# NSS 的包分散在两处，别只盯着 feed 目录：
+#   feeds/nss_packages/...  → 驱动主体（qca-nss-drv / qca-nss-ecm）、固件、nss-ifb
+#   package/kernel/...      → datapath（qca-nss-dp）与 switch SDK（qca-ssdk），源码树自带，
+#                             这两个包名分别对应 kmod-qca-nss-dp / kmod-qca-ssdk
+NSS_CHECK="
+feeds/nss_packages/qca-nss-drv
+feeds/nss_packages/qca-nss-ecm
+feeds/nss_packages/nss-ifb
+feeds/nss_packages/firmware/nss-firmware
+package/kernel/qca-nss-dp
+package/kernel/qca-ssdk
+"
+for p in $NSS_CHECK; do
+  if [ -e "$p" ]; then
+    echo "  OK   $p"
+  else
+    echo "!! $p 缺失" >&2
+    echo "   当前实际存在的相关目录：" >&2
+    ls -d feeds/nss_packages/*/ 2>/dev/null >&2 || true
+    ls -d package/kernel/qca-*/ 2>/dev/null >&2 || true
+    exit 1
+  fi
 done
 
 echo "改造完成。"
