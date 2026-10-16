@@ -1,0 +1,342 @@
+name: Build OpenWrt for JDCloud RE-SS-01 亚瑟（无WiFi / NSS / USB3 / SSR-Plus / Open-Box）
+
+# 说明
+#   - 底座：laipeng668/immortalwrt @ openwrt-25.12（上游 ImmortalWrt 官方仓库没有 nss_packages feed，
+#           亚瑟的 NSS 硬件加速驱动只在这个 fork 的 feeds 里，所以必须用它）
+#   - 机型：qualcommax/ipq60xx → jdcloud_re-ss-01
+#   - 无 WiFi：ath11k 驱动/固件与 ipq-wifi 校准数据全部剔除
+#   - USB：kmod-usb3 + dwc3-qcom + storage/uas + ext4/exfat/ntfs3 ...
+#   - 硬件加速：NSS 12.5（drv/ecm/dp/ssdk + 隧道卸载）
+#   - 预装 ShadowSocksR Plus（luci-app-ssr-plus，源码不在 feeds，由 scripts/diy-arthur.sh 拉取）
+#   - 预置 Open-Box 运行环境（依赖预装 + 首启自动执行官方安装脚本）
+#
+# 触发：Actions → 本 workflow → Run workflow（只走手动触发，避免推代码就排长队）
+
+on:
+  workflow_dispatch:
+    inputs:
+      default_lan_ip:
+        description: 默认 LAN 地址
+        required: false
+        default: 192.168.2.1
+      default_hostname:
+        description: 默认主机名
+        required: false
+        default: JDCloud-Arthur
+      publish_release:
+        description: 编译成功后发布到 Release
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OPENWRT_REPO: https://github.com/laipeng668/immortalwrt.git
+  OPENWRT_BRANCH: openwrt-25.12
+  TARGET: qualcommax/ipq60xx
+  ARTIFACT_PREFIX: Arthur.RE-SS-01.NoWiFi
+  RELEASE_TAG: arthur-nowifi
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    name: Build qualcommax/ipq60xx jdcloud_re-ss-01
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: write
+
+    steps:
+      - name: 取出本仓库
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: 腾出磁盘（OpenWrt 全量编译要 ~30GB）
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" 2>/dev/null || true
+          sudo apt-get -qq clean
+          df -h /
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+            git gperf haveged help2man intltool jq libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libfuse-dev libssl-dev libtool \
+            lrzsz genisoimage msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+            libpython3-dev qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip \
+            vim wget xmlto xxd zlib1g-dev
+          sudo timedatectl set-timezone "$TZ"
+          df -h /
+
+      - name: 克隆源码（ImmortalWrt 25.12，带 NSS feed）
+        run: |
+          git clone --depth 1 -b "$OPENWRT_BRANCH" --single-branch "$OPENWRT_REPO" openwrt
+          cd openwrt
+          echo "OPENWRT_COMMIT=$(git rev-parse HEAD)" | tee -a "$GITHUB_ENV"
+          git show -s --format='源码: %H  %cd  %s' --date=short
+
+      - name: 更新并安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "----- feeds.conf.default -----"
+          cat feeds.conf.default
+
+      - name: 改造源码树（SSR-Plus 源码 / overlay / 默认IP）
+        env:
+          DEFAULT_LAN_IP: ${{ inputs.default_lan_ip }}
+          DEFAULT_HOSTNAME: ${{ inputs.default_hostname }}
+        run: bash scripts/diy-arthur.sh
+
+      # 早期闸门：10 分钟级别暴露"符号写错 / 依赖缺失"，而不是等一小时编完才发现
+      - name: 生成 .config 并校验（符号 + 依赖）
+        run: |
+          set -o pipefail
+          cd openwrt
+          cat ../configs/arthur-device.config ../configs/arthur-packages.config > .config
+          make defconfig 2>&1 | tee "$GITHUB_WORKSPACE/defconfig.log"
+
+          echo "===== 期望为 y 的关键项 ====="
+          fail=0
+          on_sym() {
+            if grep -qE "^CONFIG_(PACKAGE|DEFAULT|MODULE_DEFAULT)_$1=(y|m)$" .config; then
+              echo "  OK   $1"
+            else
+              echo "  MISS $1"
+              fail=1
+            fi
+          }
+          off_sym() {
+            if grep -qE "^CONFIG_PACKAGE_$1=n$|^# CONFIG_PACKAGE_$1 is not set$" .config; then
+              echo "  OFF  $1"
+            else
+              echo "  !!   $1 没被关掉"
+              fail=1
+            fi
+          }
+          # 无线包在多机型构建里会被降级成 =m（留给别的机型），所以这里只要求"不是 =y"，
+          # 真正"没进镜像"由最后一步的 manifest 校验保证。
+          not_y_sym() {
+            if grep -qE "^CONFIG_(PACKAGE|DEFAULT|MODULE_DEFAULT)_$1=y$" .config; then
+              echo "  !!   $1 被编成了 built-in，无WiFi 不该出现"
+              fail=1
+            else
+              echo "  OK   非 built-in：$1"
+            fi
+          }
+
+          for s in \
+            kmod-usb3 kmod-usb-dwc3-qcom kmod-usb-storage-uas \
+            kmod-fs-ext4 kmod-fs-exfat kmod-fs-ntfs3 block-mount luci-app-diskman \
+            kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-nss-dp kmod-qca-ssdk \
+            nss-firmware-ipq60xx kmod-nss-ifb \
+            luci-app-ssr-plus \
+            luci-app-ssr-plus_Nftables_Transparent_Proxy \
+            luci-app-ssr-plus_INCLUDE_Xray \
+            luci-app-ssr-plus_INCLUDE_Shadowsocks_Rust_Client \
+            luci-app-ssr-plus_INCLUDE_ShadowsocksR_Libev_Client \
+            luci-app-ssr-plus_INCLUDE_ChinaDNS_NG \
+            shadowsocksr-libev-ssr-redir shadowsocksr-libev-ssr-local \
+            xray-core shadowsocks-rust-sslocal chinadns-ng microsocks ipt2socks \
+            dns2tcp lua-neturl lyaml nping resolveip \
+            dnsmasq-full luci-compat \
+            kmod-tun kmod-nft-queue kmod-nft-tproxy kmod-nft-socket kmod-nft-nat kmod-veth \
+            ip-full nftables-json ca-bundle ; do
+            on_sym "$s"
+          done
+
+          echo "===== 期望被关闭的项（无WiFi / 单一代理栈）====="
+          for s in luci-app-passwall luci-app-openclash ; do
+            off_sym "$s"
+          done
+          for s in kmod-ath11k kmod-ath11k-ahb ath11k-firmware-ipq6018 ipq-wifi-jdcloud_re-ss-01 ; do
+            not_y_sym "$s"
+          done
+
+          echo "===== 依赖缺失检查 ====="
+          if grep -qE 'which is not available|is not available' "$GITHUB_WORKSPACE/defconfig.log"; then
+            echo "::error::defconfig 报告了不可用的依赖，见上面日志"
+            grep -E 'which is not available|is not available' "$GITHUB_WORKSPACE/defconfig.log" || true
+            fail=1
+          else
+            echo "  OK   没有不可用依赖"
+          fi
+
+          echo "===== 分区/镜像 ---"
+          grep -E '^CONFIG_TARGET_ROOTFS_(SQUASHFS|EXT4FS)' .config || true
+          cp .config "$GITHUB_WORKSPACE/arthur.build.config"
+
+          [ "$fail" = 0 ] || { echo "::error::配置校验失败，先别开编，检查上面的 MISS / !! 项"; exit 1; }
+
+      - name: 恢复 ccache
+        uses: actions/cache@v4
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ env.OPENWRT_BRANCH }}-arthur-${{ hashFiles('configs/arthur-device.config', 'configs/arthur-packages.config', 'scripts/diy-arthur.sh') }}
+          restore-keys: |
+            ccache-${{ env.OPENWRT_BRANCH }}-arthur-
+            ccache-${{ env.OPENWRT_BRANCH }}-
+
+      - name: 恢复工具链
+        uses: actions/cache@v4
+        with:
+          path: openwrt/staging_dir
+          key: staging-${{ env.OPENWRT_BRANCH }}-arthur-${{ hashFiles('configs/arthur-device.config', 'configs/arthur-packages.config', 'scripts/diy-arthur.sh') }}
+          restore-keys: |
+            staging-${{ env.OPENWRT_BRANCH }}-arthur-
+            staging-${{ env.OPENWRT_BRANCH }}-
+
+      - name: 下载源码包
+        run: |
+          set -o pipefail
+          cd openwrt
+          # 缓存还原会把 staging_dir 的时间戳打乱，make 会当成"全部过期"重编一遍，
+          # 缓存就白做了。这里把各 stamp 重新 touch 一遍（与上游 Roc CI 同样做法）。
+          if [ -d staging_dir ]; then
+            tools_stamp="$(find staging_dir/host -maxdepth 2 -type f -name '.tools_compile*' -print -quit 2>/dev/null || true)"
+            if [ -n "$tools_stamp" ]; then
+              find staging_dir/host/stamp -maxdepth 1 -type f ! -name '.tools_compile*' -exec touch {} + 2>/dev/null || true
+              find staging_dir/host -maxdepth 2 -type f -name '.tools_compile*' -exec touch {} + 2>/dev/null || true
+            fi
+            for toolchain_dir in staging_dir/toolchain-*; do
+              [ -d "$toolchain_dir" ] || continue
+              toolchain_stamp="$(find "$toolchain_dir" -maxdepth 2 -type f -name '.toolchain_compile*' -print -quit 2>/dev/null || true)"
+              [ -n "$toolchain_stamp" ] || continue
+              find "$toolchain_dir/stamp" -maxdepth 1 -type f ! -name '.toolchain_compile*' -exec touch {} + 2>/dev/null || true
+              find "$toolchain_dir" -maxdepth 2 -type f -name '.toolchain_compile*' -exec touch {} + 2>/dev/null || true
+            done
+            echo "staging_dir 已还原，stamp 已刷新"
+          fi
+          for attempt in 1 2 3; do
+            if make -j"$(nproc)" download; then exit 0; fi
+            echo "::warning::make download 第 $attempt 次失败，清掉不完整文件后重试"
+            find dl -type f -size -1024c -print -delete || true
+            sleep $((attempt * 5))
+          done
+          echo "::error::make download 连续失败"; exit 1
+
+      - name: 编译固件
+        run: |
+          set -o pipefail
+          cd openwrt
+          ( make -j"$(nproc)" V=s 2>&1 || make -j1 V=s 2>&1 ) | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: 校验产物（NSS / USB / SSR-Plus 必须在，WiFi 驱动必须不在）
+        run: |
+          set -e
+          cd openwrt/bin/targets/qualcommax/ipq60xx
+          echo "----- 产物清单 -----"
+          ls -lh
+          MANIFEST="$(ls ./*.manifest | head -1)"
+          echo "使用 manifest: $MANIFEST"
+
+          echo "----- 必须有 -----"
+          fail=0
+          for p in kmod-qca-nss-drv kmod-qca-nss-ecm kmod-qca-nss-dp kmod-qca-ssdk nss-firmware-ipq60xx \
+                   kmod-usb3 kmod-usb-dwc3-qcom kmod-usb-storage kmod-usb-storage-uas \
+                   kmod-fs-ext4 kmod-fs-exfat kmod-fs-ntfs3 block-mount luci-app-diskman \
+                   luci-app-ssr-plus xray-core shadowsocksr-libev-ssr-redir chinadns-ng dnsmasq-full \
+                   kmod-tun kmod-nft-queue kmod-nft-tproxy kmod-veth ip-full ca-bundle ; do
+            if grep -q "^$p " "$MANIFEST"; then
+              echo "  OK   $p"
+            else
+              echo "  MISS $p"; fail=1
+            fi
+          done
+
+          echo "----- 必须没有 -----"
+          for p in ath11k-firmware-ipq6018 kmod-ath11k ipq-wifi-jdcloud_re-ss-01 luci-app-passwall; do
+            if grep -q "^$p " "$MANIFEST"; then
+              echo "  !!   竟然存在 $p"; fail=1
+            else
+              echo "  OK   不含 $p"
+            fi
+          done
+
+          echo "----- 可执行镜像 -----"
+          ls ./*.bin ./*.itb 2>/dev/null || true
+          [ "$fail" = 0 ] || { echo "::error::产物清单与预期不符，检查上面的 MISS / !! 项"; exit 1; }
+
+      - name: 整理产物
+        if: success()
+        run: |
+          mkdir -p out
+          src=openwrt/bin/targets/qualcommax/ipq60xx
+          cp -v "$src"/*.bin "$src"/*.itb "$src"/*.manifest "$src"/sha256sums "$src"/profiles.json out/ 2>/dev/null || true
+          cp -v "$src"/*.tar out/ 2>/dev/null || true
+          cp -v arthur.build.config "out/$ARTIFACT_PREFIX.config" 2>/dev/null || true
+          cp -v third-party-sources.txt "out/$ARTIFACT_PREFIX.third-party-sources.txt" 2>/dev/null || true
+          echo "OPENWRT_COMMIT=$OPENWRT_COMMIT" > "out/$ARTIFACT_PREFIX.buildinfo"
+          echo "----- out/ -----"
+          ls -lh out/
+          ( cd out && sha256sum ./*.bin 2>/dev/null > SHA256SUMS || true )
+          ls out/*.bin >/dev/null 2>&1 || { echo "::error::out/ 里没有任何 .bin 镜像"; exit 1; }
+
+      - name: 上传固件
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_PREFIX }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传失败日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            build.log
+            defconfig.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 记录编译时间
+        id: stamp
+        run: echo "build_time=$(date '+%F %T %Z')" >> "$GITHUB_OUTPUT"
+
+      - name: 发布 Release
+        if: ${{ success() && inputs.publish_release }}
+        uses: ncipollo/release-action@v1
+        with:
+          name: JDCloud RE-SS-01 亚瑟 无WiFi (NSS + USB + SSR-Plus + Open-Box)
+          tag: ${{ env.RELEASE_TAG }}
+          allowUpdates: true
+          replacesArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: out/*
+          token: ${{ github.token }}
+          body: |
+            **JDCloud RE-SS-01（京东云无线宝 亚瑟 AX1800 Pro）OpenWrt 固件**
+
+            ### 固件特性
+            - 🚫 **无 WiFi**：ath11k 驱动、固件与校准数据全部剔除
+            - ⚡ **NSS 硬件加速**：NSS 12.5（drv / ecm / dp / ssdk + PPPoE/L2TP/PPTP/GRE/MAP-T 等隧道卸载）
+            - 🔌 **USB 3.0**：dwc3-qcom + storage/uas + ext4 / exfat / ntfs3 / vfat / f2fs + diskman 挂载
+            - 🧦 **预装 ShadowSocksR Plus**：`luci-app-ssr-plus`（nftables 透明代理，含 Xray / Shadowsocks-Rust / SSR-Libev / ChinaDNS-NG / GeoData）
+            - 📦 **预置 Open-Box**：依赖已内置，首次开机联网后自动执行官方安装脚本（日志 `/root/open-box-install.log`，面板默认 3036）
+            - 🎛 主题 Aurora、中文默认、zram-swap、cpufreq、ttyd、diskman、hd-idle、WOL、watchcat 等
+            - ⚙️ 底座：ImmortalWrt 25.12 + 6.18 内核；源码 ${{ env.OPENWRT_REPO }} (@${{ env.OPENWRT_BRANCH }})
+
+            ### 信息
+            - 🌐 默认地址：**${{ inputs.default_lan_ip }}** ／ root ／ 无密码（首次登录请立刻设密码）
+            - 🔨 编译时间：${{ steps.stamp.outputs.build_time }}
+            - 🧷 源码 commit：`${{ env.OPENWRT_COMMIT }}`
+
+            ### ⚠️ 刷机提醒
+            - 本固件为 **无 WiFi** 版本，装完不提供无线功能，只做有线路由/旁路由。
+            - 亚瑟需要先解锁并刷好 U-Boot（Hugo）与 **大分区** GPT，再刷 `factory.bin`；
+              之后升级用 LuCI 刷 `sysupgrade.bin`。刷机前务必备份原厂分区。
+            - SSR-Plus 与 Open-Box 都会接管透明代理与 DNS，请**只启用其中一个**。

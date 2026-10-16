@@ -1,0 +1,95 @@
+#!/bin/sh
+#
+# 亚瑟固件预置：首次开机自动安装 Open-Box（一体化透明代理）
+#
+# 为什么不是"把二进制打进固件"：
+#   Open-Box 自有程序是闭源发布包，官方 install.sh 会按架构（本机 aarch64）
+#   从 GitHub Releases 下载约 106MB 运行时（内含 sing-box 内核、Node 运行时、
+#   GeoSite/GeoIP 数据），并注册开机自启。所以固件这边做的是"依赖预装 +
+#   首启自动执行官方安装脚本"，装完就是开箱可用。
+#
+# 成功 -> 返回 0，本文件被 /etc/init.d/boot 删除，不再执行。
+# 失败 -> 返回 1，本文件保留，下次开机会继续重试（最多 3 次，之后停手不再骚扰）。
+#
+# 日志：/root/open-box-install.log     手动安装/排错：见 /usr/share/open-box/README.txt
+#
+
+LOG=/root/open-box-install.log
+LOCK=/tmp/open-box-install.lock
+TRIES=/root/.open-box-install.tries
+PANEL_PORT=3036
+MAX_TRIES=3
+
+# 装好了就收工（本文件随之被删除）
+if [ -x /etc/init.d/openbox ] && [ -x /etc/init.d/openbox-panel ]; then
+    logger -t open-box "已安装，跳过自动安装"
+    exit 0
+fi
+
+# 上一轮的后台任务还在跑，别叠着来
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+    exit 1
+fi
+
+tries=$(cat "$TRIES" 2>/dev/null || echo 0)
+case "$tries" in ''|*[!0-9]*) tries=0 ;; esac
+if [ "$tries" -ge "$MAX_TRIES" ]; then
+    # 反复失败就别每次开机都重来，留个明确的提示
+    logger -t open-box "连续 $MAX_TRIES 次自动安装失败，停止重试；手动安装见 /usr/share/open-box/README.txt"
+    exit 0
+fi
+
+echo $((tries + 1)) > "$TRIES"
+
+# 后台跑，不阻塞开机（106MB 下载在启动流程里等不起）
+(
+    echo $$ > "$LOCK"
+    exec >>"$LOG" 2>&1
+    date "+===== %F %T 开始安装 Open-Box（第 $((tries + 1)) 次尝试）====="
+    mkdir -p /opt
+    awk '/^MemTotal:/ {printf "MemTotal: %d MB\n", $2 / 1024}' /proc/meminfo
+    df -h / /opt 2>/dev/null
+
+    # 等网络就绪，最多 5 分钟
+    n=0
+    while [ "$n" -lt 30 ]; do
+        ping -c1 -W2 223.5.5.5 >/dev/null 2>&1 && break
+        n=$((n + 1))
+        sleep 10
+    done
+
+    # 取官方安装脚本：主站不通就走镜像（脚本本身很小）
+    got=0
+    for base in \
+        https://raw.githubusercontent.com/liandu2024/Open-Box/main/scripts \
+        https://cdn.jsdelivr.net/gh/liandu2024/Open-Box@main/scripts \
+        https://ghproxy.net/https://raw.githubusercontent.com/liandu2024/Open-Box/main/scripts ; do
+        if curl -fsSL --connect-timeout 15 --retry 2 -o /tmp/open-box-install.sh "$base/install.sh"; then
+            echo "已获取安装脚本：$base/install.sh"
+            got=1
+            break
+        fi
+        echo "拉取安装脚本失败：$base/install.sh"
+    done
+
+    if [ "$got" != 1 ]; then
+        echo "网络不通，取不到安装脚本。下次开机自动重试，或 SSH 手动安装（见 /usr/share/open-box/README.txt）。"
+        exit 1
+    fi
+
+    sh /tmp/open-box-install.sh --port "$PANEL_PORT"
+    rc=$?
+    echo "===== install.sh 退出码：$rc ====="
+
+    if [ "$rc" = 0 ]; then
+        echo 0 > "$TRIES"
+        [ -x /etc/init.d/openbox ] && /etc/init.d/openbox start
+        echo "安装完成，面板端口 $PANEL_PORT，浏览器打开 http://<路由器IP>:$PANEL_PORT 设置密码。"
+    else
+        echo "安装失败。常见原因：内存不足（需 MemTotal≥440MB）/ 存储不足（需≥512MB 可用）/ 网络问题。"
+    fi
+    exit $rc
+) &
+
+# 保留本文件，下次开机由脚本自身判断是否需要重试
+exit 1
