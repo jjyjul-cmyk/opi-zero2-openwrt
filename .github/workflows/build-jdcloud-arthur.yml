@@ -10,9 +10,14 @@ name: Build OpenWrt for JDCloud RE-SS-01 亚瑟（无WiFi / NSS / USB3 / SSR-Plu
 #   - 预装 ShadowSocksR Plus（luci-app-ssr-plus，源码不在 feeds，由 scripts/diy-arthur.sh 拉取）
 #   - 预置 Open-Box 运行环境（依赖预装 + 首启自动执行官方安装脚本）
 #
-# 触发：Actions → 本 workflow → Run workflow（只走手动触发，避免推代码就排长队）
+# 触发：推送到 arthur 分支自动编译（也可 Actions → 本 workflow → Run workflow 手动触发）
+#       注：GitHub 规定 workflow_dispatch 的工作流文件必须存在于默认分支上才能手动触发，
+#       为了不动 main，这里改用 push 事件（仅监听 arthur 分支）作为主入口。
 
 on:
+  push:
+    branches:
+      - arthur
   workflow_dispatch:
     inputs:
       default_lan_ip:
@@ -31,7 +36,7 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   OPENWRT_REPO: https://github.com/laipeng668/immortalwrt.git
@@ -40,6 +45,9 @@ env:
   ARTIFACT_PREFIX: Arthur.RE-SS-01.NoWiFi
   RELEASE_TAG: arthur-nowifi
   TZ: Asia/Shanghai
+  # push 触发时没有 inputs，用 || 兜底（push 事件下 inputs.* 为空字符串）
+  DEFAULT_LAN_IP: ${{ inputs.default_lan_ip || '192.168.2.1' }}
+  DEFAULT_HOSTNAME: ${{ inputs.default_hostname || 'JDCloud-Arthur' }}
 
 jobs:
   build:
@@ -94,9 +102,6 @@ jobs:
           cat feeds.conf.default
 
       - name: 改造源码树（SSR-Plus 源码 / overlay / 默认IP）
-        env:
-          DEFAULT_LAN_IP: ${{ inputs.default_lan_ip }}
-          DEFAULT_HOSTNAME: ${{ inputs.default_hostname }}
         run: bash scripts/diy-arthur.sh
 
       # 早期闸门：10 分钟级别暴露"符号写错 / 依赖缺失"，而不是等一小时编完才发现
@@ -308,7 +313,7 @@ jobs:
         run: echo "build_time=$(date '+%F %T %Z')" >> "$GITHUB_OUTPUT"
 
       - name: 发布 Release
-        if: ${{ success() && inputs.publish_release }}
+        if: ${{ success() && (github.event_name == 'push' || inputs.publish_release) }}
         uses: ncipollo/release-action@v1
         with:
           name: JDCloud RE-SS-01 亚瑟 无WiFi (NSS + USB + SSR-Plus + Open-Box)
@@ -331,7 +336,7 @@ jobs:
             - ⚙️ 底座：ImmortalWrt 25.12 + 6.18 内核；源码 ${{ env.OPENWRT_REPO }} (@${{ env.OPENWRT_BRANCH }})
 
             ### 信息
-            - 🌐 默认地址：**${{ inputs.default_lan_ip }}** ／ root ／ 无密码（首次登录请立刻设密码）
+            - 🌐 默认地址：**${{ env.DEFAULT_LAN_IP }}** ／ root ／ 无密码（首次登录请立刻设密码）
             - 🔨 编译时间：${{ steps.stamp.outputs.build_time }}
             - 🧷 源码 commit：`${{ env.OPENWRT_COMMIT }}`
 
